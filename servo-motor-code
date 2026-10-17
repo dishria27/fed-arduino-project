@@ -1,0 +1,23 @@
+#include <ESP32Servo.h>
+#make sure to set baud rate to 115200 in serial monitor
+
+Servo myServo;
+const int SERVO_PIN = 18;
+
+void setup() {
+  Serial.begin(115200);
+  myServo.setPeriodHertz(50);              // standard 50 Hz servo signal
+  myServo.attach(SERVO_PIN, 500, 2400);    // min/max pulse in microseconds
+  myServo.write(90);                       // start centered
+  Serial.println("Send an angle 0-180");
+}
+
+void loop() {
+  if (Serial.available()) {
+    int angle = Serial.parseInt();
+    if (angle >= 0 && angle <= 180) {
+      myServo.write(angle);
+      Serial.printf("Moved to %d\n", angle);
+    }
+  }
+}
