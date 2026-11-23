@@ -1,0 +1,182 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <ESP32Servo.h>
+#include <Adafruit_VL53L0X.h>
+
+// ---------- Wi-Fi access point ----------
+const char* AP_SSID = "ESP32_Hotspot";
+const char* AP_PASS = "12345678";          // at least 8 characters
+
+// ---------- Pins ----------
+const int SERVO_PIN = 18;
+const int LED_PIN   = 4;
+const int MIC_PIN   = 34;                  // MAX4466 OUT (ADC1)
+const int SDA_PIN   = 21;
+const int SCL_PIN   = 22;
+
+// ---------- Settings to tune ----------
+const int  SERVO_REST_ANGLE = 0;
+const int  SERVO_PUSH_ANGLE = 90;
+const int  SWITCH_DOWN_MM   = 80;          // distance below this = switch is down
+const int  CLAP_THRESHOLD   = 1500;        // peak-to-peak level (0-4095) that counts as a clap
+const bool DEBUG_SOUND      = false;       // true = print mic levels to tune the threshold
+const unsigned long CLAP_MIN_GAP_MS = 150; // ignore echo/ringing right after a clap
+const unsigned long CLAP_WINDOW_MS  = 1000;// second clap must come within this time
+const unsigned long COOLDOWN_MS     = 1500;// pause after each action
+
+WebServer server(80);
+Servo armServo;
+Adafruit_VL53L0X lox;
+
+bool ledOn = false;
+unsigned long lastActionTime = 0;
+
+// ---------- Distance sensor (VL53L0X) ----------
+int readDistanceMm() {
+  VL53L0X_RangingMeasurementData_t m;
+  lox.rangingTest(&m, false);
+  if (m.RangeStatus == 4 || m.RangeMilliMeter >= 8190) return -1;  // out of range
+  return m.RangeMilliMeter;
+}
+
+bool switchIsDown() {
+  int total = 0, valid = 0;
+  for (int i = 0; i < 3; i++) {            // average 3 readings
+    int d = readDistanceMm();
+    if (d > 0) { total += d; valid++; }
+  }
+  if (valid == 0) return false;
+  return (total / valid) < SWITCH_DOWN_MM;
+}
+
+// ---------- Servo action ----------
+void flipSwitch() {
+  armServo.write(SERVO_PUSH_ANGLE);
+  delay(600);
+  armServo.write(SERVO_REST_ANGLE);
+  delay(400);
+  ledOn = true;
+  digitalWrite(LED_PIN, HIGH);
+  lastActionTime = millis();
+}
+
+bool tryFlip(const char* source) {
+  if (millis() - lastActionTime < COOLDOWN_MS) return false;
+  if (!switchIsDown()) {
+    Serial.printf("[%s] ignored: switch is not down\n", source);
+    return false;
+  }
+  Serial.printf("[%s] flipping switch\n", source);
+  flipSwitch();
+  return true;
+}
+
+// ---------- Microphone (MAX4466) ----------
+// The mic output swings around the middle (~1.65 V), so measure the
+// peak-to-peak swing over a short 10 ms window.
+int soundLevel() {
+  unsigned long start = millis();
+  int mn = 4095, mx = 0;
+  while (millis() - start < 10) {
+    int v = analogRead(MIC_PIN);
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  return mx - mn;
+}
+
+bool doubleClapDetected() {
+  static bool lastLoud = false;
+  static int clapCount = 0;
+  static unsigned long firstClapTime = 0, lastClapTime = 0;
+
+  unsigned long now = millis();
+  int level = soundLevel();
+  if (DEBUG_SOUND && level > 300) Serial.println(level);
+
+  bool loud = (level > CLAP_THRESHOLD);
+  bool result = false;
+
+  if (loud && !lastLoud && (now - lastClapTime > CLAP_MIN_GAP_MS)) {
+    lastClapTime = now;
+    if (clapCount == 0 || (now - firstClapTime) > CLAP_WINDOW_MS) {
+      clapCount = 1;
+      firstClapTime = now;
+    } else {
+      clapCount = 0;
+      result = true;
+    }
+  }
+  if (clapCount == 1 && (now - firstClapTime) > CLAP_WINDOW_MS) clapCount = 0;
+
+  lastLoud = loud;
+  return result;
+}
+
+// ---------- Web page ----------
+const char PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Switch</title>
+<style>
+  body{font-family:sans-serif;text-align:center;margin-top:60px}
+  button{font-size:1.6em;padding:20px 40px;border:0;border-radius:12px;background:#2a7de1;color:#fff}
+  #msg{margin-top:30px;font-size:1.2em}
+</style></head><body>
+<h2>Switch Control</h2>
+<button onclick="go()">Turn Switch</button>
+<div id="msg"></div>
+<script>
+function go(){
+  fetch('/toggle').then(r=>r.text()).then(t=>{document.getElementById('msg').innerText=t;});
+}
+</script></body></html>
+)rawliteral";
+
+void handleRoot()   { server.send_P(200, "text/html", PAGE); }
+void handleToggle() {
+  if (tryFlip("phone")) server.send(200, "text/plain", "Done: switch turned, LED on");
+  else                  server.send(200, "text/plain", "Not done: switch is not down (or wait a moment)");
+}
+
+// ---------- Setup / loop ----------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(MIC_PIN, ADC_11db);   // full 0-3.3 V range
+
+  Wire.begin(SDA_PIN, SCL_PIN);
+  if (!lox.begin()) {
+    Serial.println("VL53L0X not found - check SDA/SCL wiring and power");
+    while (true) delay(100);
+  }
+
+  armServo.setPeriodHertz(50);
+  armServo.attach(SERVO_PIN, 500, 2400);
+  armServo.write(SERVO_REST_ANGLE);
+
+  WiFi.softAP(AP_SSID, AP_PASS);
+  Serial.print("AP IP address: ");
+  Serial.println(WiFi.softAPIP());              // normally 192.168.4.1
+
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggle);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  if (doubleClapDetected()) tryFlip("claps");
+
+  // LED goes off again once the switch is back down
+  if (ledOn && millis() - lastActionTime > COOLDOWN_MS && switchIsDown()) {
+    ledOn = false;
+    digitalWrite(LED_PIN, LOW);
+  }
+}
