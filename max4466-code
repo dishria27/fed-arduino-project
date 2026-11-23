@@ -1,0 +1,51 @@
+// Define the analog pin connected to the MAX4466 OUT pin
+// WIRE TO PIN 34
+const int MIC_PIN = 34; 
+
+// Sample window width in milliseconds (50 ms = 20Hz)
+const int sampleWindow = 50; 
+
+void setup() {
+  // Initialize serial communication at 115200 baud rate!!
+  Serial.begin(115200);
+  
+  // Configure the microphone pin as an input
+  pinMode(MIC_PIN, INPUT);
+}
+
+void loop() {
+  unsigned long startMillis = millis();  // Start of sample window
+  unsigned int peakToPeak = 0;           // Peak-to-peak level
+
+  unsigned int signalMax = 0;            // Minimum possible ADC value
+  unsigned int signalMin = 4095;         // Maximum possible ADC value (ESP32 is 12-bit)
+
+  // Collect data for 50 milliseconds
+  while (millis() - startMillis < sampleWindow) {
+    unsigned int sample = analogRead(MIC_PIN);
+
+    // Filter out potential anomalous ESP32 ADC readings
+    if (sample < 4096) {
+      if (sample > signalMax) {
+        signalMax = sample;  // Save the highest sound peak
+      }
+      else if (sample < signalMin) {
+        signalMin = sample;  // Save the lowest sound peak
+      }
+    }
+  }
+
+  // Calculate the difference between the max and min amplitude
+  peakToPeak = signalMax - signalMin;  
+
+  // Convert the raw ADC peak-to-peak amplitude into Volts
+  // ESP32 ADC resolution is 12-bit (0 - 4095) across a 3.3V range
+  double volts = (peakToPeak * 3.3) / 4095.0;
+
+  // Print results to the Serial Monitor / Serial Plotter
+  Serial.print("Raw_Peak-to-Peak: ");
+  Serial.print(peakToPeak);
+  Serial.print("\t Volts: ");
+  Serial.println(volts);
+}
+
